@@ -1,12 +1,15 @@
 import json
 import re
 from core.llm import LLM
+from core.memory import Memory
 from tools import TOOLS, execute_tool
 
 SYSTEM_PROMPT = """You are a personal AI assistant. You help with tasks by reasoning step by step and using tools when needed.
 
 You have access to these tools:
 {tool_descriptions}
+
+{memory_context}
 
 To use a tool, respond in this exact format:
 THOUGHT: your reasoning about what to do
@@ -25,11 +28,13 @@ Rules:
 - ONLY state facts that came from a tool result. Never use your training data for factual claims.
 - If the user asks a follow-up, use context from previous messages in this conversation.
 - If you need fresher data for a follow-up, search again with a more specific query.
+- If the user tells you something personal or a preference, use save_memory ONCE then immediately give a FINAL_ANSWER acknowledging what you saved. Never save the same information twice.
 """
 
 class Agent:
     def __init__(self):
         self.llm = LLM()
+        self.memory = Memory()
         self.max_steps = 6
         self.conversation_history = []
 
@@ -38,6 +43,20 @@ class Agent:
             f"- {name}: {meta['description']}"
             for name, meta in TOOLS.items()
         )
+
+    def _build_memory_context(self, user_input: str) -> str:
+        facts = self.memory.search_facts(user_input)
+        past = self.memory.search_history(user_input)
+
+        lines = []
+        if facts:
+            lines.append("What you know about the user:")
+            lines.extend(f"  - {f}" for f in facts)
+        if past:
+            lines.append("Relevant past exchanges:")
+            lines.extend(f"  {p}" for p in past)
+
+        return ("MEMORY CONTEXT:\n" + "\n".join(lines) + "\n") if lines else ""
 
     def _parse_response(self, text: str) -> dict:
         if "FINAL_ANSWER:" in text:
@@ -65,17 +84,21 @@ class Agent:
     def run(self, user_input: str) -> str:
         self.conversation_history.append({"role": "user", "content": user_input})
 
+        memory_context = self._build_memory_context(user_input)
+
         messages = [
             {
                 "role": "system",
                 "content": SYSTEM_PROMPT.format(
-                    tool_descriptions=self._build_tool_descriptions()
+                    tool_descriptions=self._build_tool_descriptions(),
+                    memory_context=memory_context
                 )
             },
             *self.conversation_history
         ]
 
-        tool_calls_this_turn = []  # track what happened this turn
+        tool_calls_this_turn = []
+        memory_saved_this_turn = set()  # prevent duplicate saves
 
         for step in range(self.max_steps):
             try:
@@ -86,7 +109,8 @@ class Agent:
             parsed = self._parse_response(response)
 
             if parsed["type"] == "final":
-                # Build a rich history entry that includes tool context
+                self.memory.save_exchange(user_input, parsed["content"])
+
                 history_content = parsed["content"]
                 if tool_calls_this_turn:
                     summary = " | ".join(
@@ -105,11 +129,20 @@ class Agent:
                 print(f"[Step {step+1}] {parsed['thought']}")
                 print(f"  → Using tool: {parsed['action']} with {parsed['input']}")
 
-                result = execute_tool(parsed["action"], parsed["input"])
+                if parsed["action"] == "save_memory":
+                    fact = parsed["input"].get("fact", "").strip()
+                    if fact and fact not in memory_saved_this_turn:
+                        self.memory.save_fact(fact)
+                        memory_saved_this_turn.add(fact)
+                        result = f"Saved to memory: '{fact}'. Now give a FINAL_ANSWER acknowledging this."
+                    else:
+                        result = "Already saved this turn. Give a FINAL_ANSWER now."
+                else:
+                    result = execute_tool(parsed["action"], parsed["input"])
+
                 result_trimmed = result[:500]
                 print(f"  ← Result: {result_trimmed[:100]}...")
 
-                # Track tool calls for history
                 tool_calls_this_turn.append({
                     "query": parsed["input"].get("query", str(parsed["input"])),
                     "result": result_trimmed
@@ -133,3 +166,12 @@ class Agent:
     def clear_history(self):
         self.conversation_history = []
         print("Conversation history cleared.")
+
+    def show_memory(self):
+        facts = self.memory.list_all_facts()
+        if not facts:
+            print("No facts stored yet.")
+        else:
+            print("\nStored facts:")
+            for i, f in enumerate(facts, 1):
+                print(f"  {i}. {f}")
