@@ -1,7 +1,4 @@
 ollama
-chromadb
-langchain
 tavily-python
-PyQt6
-pyautogui
 python-dotenv
+chromadb
